@@ -1,0 +1,191 @@
+# action.yml
+name: 'Container Registry Cleanup'
+description: 'Cleanup old container images from GitHub Container Registry'
+author: 'ruedigerp'
+
+branding:
+  icon: 'trash-2'
+  color: 'red'
+
+inputs:
+  package-name:
+    description: 'Name of the container package to cleanup'
+    required: true
+  token:
+    description: 'GitHub token with packages:write permission'
+    required: true
+  days-old:
+    description: 'Delete versions older than this many days'
+    required: false
+    default: '21'
+  min-versions-to-keep:
+    description: 'Minimum number of old versions to keep'
+    required: false
+    default: '3'
+  max-versions-per-run:
+    description: 'Maximum versions to delete per run'
+    required: false
+    default: '10'
+  protected-tags:
+    description: 'Regex pattern for protected tags (pipe-separated)'
+    required: false
+    default: 'latest|main|master|develop|dev'
+  delete-untagged-only:
+    description: 'Only delete untagged versions'
+    required: false
+    default: 'false'
+
+outputs:
+  deleted-count:
+    description: 'Number of versions deleted'
+    value: ${{ steps.cleanup.outputs.deleted-count }}
+  total-versions:
+    description: 'Total versions found'
+    value: ${{ steps.cleanup.outputs.total-versions }}
+  old-versions:
+    description: 'Old versions found'
+    value: ${{ steps.cleanup.outputs.old-versions }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Container Cleanup
+      id: cleanup
+      shell: bash
+      run: |
+        echo "=== Container Registry Cleanup Action ==="
+        
+        PACKAGE_NAME="${{ inputs.package-name }}"
+        DAYS_OLD="${{ inputs.days-old }}"
+        MIN_VERSIONS_TO_KEEP="${{ inputs.min-versions-to-keep }}"
+        MAX_VERSIONS_PER_RUN="${{ inputs.max-versions-per-run }}"
+        PROTECTED_TAGS="${{ inputs.protected-tags }}"
+        DELETE_UNTAGGED_ONLY="${{ inputs.delete-untagged-only }}"
+        
+        CUTOFF_DATE=$(date -d "$DAYS_OLD days ago" -u +"%Y-%m-%dT%H:%M:%SZ")
+        
+        echo "Package: $PACKAGE_NAME"
+        echo "Delete versions older than: $CUTOFF_DATE ($DAYS_OLD days)"
+        echo "Min versions to keep: $MIN_VERSIONS_TO_KEEP"
+        echo "Max versions per run: $MAX_VERSIONS_PER_RUN"
+        echo "Protected tags pattern: $PROTECTED_TAGS"
+        echo "Delete untagged only: $DELETE_UNTAGGED_ONLY"
+        
+        # Test permissions
+        echo "Testing token permissions..."
+        user_info=$(gh api /user 2>/dev/null)
+        if [ $? -eq 0 ]; then
+          echo "✓ Token permissions working"
+          echo "$user_info" | jq '{login, id}'
+        else
+          echo "✗ Token permissions failed"
+          exit 1
+        fi
+        
+        # Fetch package versions
+        echo "Fetching package versions..."
+        if ! gh api "/user/packages/container/$PACKAGE_NAME/versions" --paginate > /tmp/versions.json; then
+          echo "ERROR: Failed to fetch package versions"
+          exit 1
+        fi
+        
+        total_versions=$(jq 'length' /tmp/versions.json)
+        echo "✓ Total versions: $total_versions"
+        echo "total-versions=$total_versions" >> $GITHUB_OUTPUT
+        
+        if [ "$total_versions" -eq 0 ]; then
+          echo "No versions found"
+          echo "deleted-count=0" >> $GITHUB_OUTPUT
+          echo "old-versions=0" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # Filter old versions
+        echo "Filtering versions older than $CUTOFF_DATE..."
+        jq --arg cutoff "$CUTOFF_DATE" '[.[] | select(.created_at < $cutoff)]' /tmp/versions.json > /tmp/old_versions.json
+        
+        old_count=$(jq 'length' /tmp/old_versions.json)
+        echo "Old versions found: $old_count"
+        echo "old-versions=$old_count" >> $GITHUB_OUTPUT
+        
+        if [ "$old_count" -eq 0 ]; then
+          echo "No old versions to delete"
+          echo "deleted-count=0" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # Apply filtering based on mode
+        if [ "$DELETE_UNTAGGED_ONLY" = "true" ]; then
+          echo "Finding untagged versions to delete..."
+          versions_to_delete=$(jq -r --argjson keep "$MIN_VERSIONS_TO_KEEP" '
+            map(select((.metadata.container.tags // []) | length == 0)) |
+            sort_by(.created_at) | reverse | .[$keep:] | .[].id
+          ' /tmp/old_versions.json)
+        else
+          echo "Finding versions to delete (untagged + old tagged)..."
+          # Escape the protected tags pattern for jq
+          escaped_pattern=$(echo "$PROTECTED_TAGS" | sed 's/|/\\|/g')
+          versions_to_delete=$(jq -r --argjson keep "$MIN_VERSIONS_TO_KEEP" --arg pattern "^($escaped_pattern)$" '
+            map(select(
+              ((.metadata.container.tags // []) | length == 0) or
+              ((.metadata.container.tags // []) | any(test($pattern)) | not)
+            )) |
+            sort_by(.created_at) | reverse | .[$keep:] | .[].id
+          ' /tmp/old_versions.json)
+        fi
+        
+        delete_count=$(echo "$versions_to_delete" | grep -v '^$' | wc -l)
+        echo "Versions to delete: $delete_count"
+        
+        if [ "$delete_count" -eq 0 ]; then
+          echo "No versions selected for deletion"
+          echo "deleted-count=0" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # Delete versions
+        echo "Starting deletion..."
+        deleted=0
+        failed=0
+        
+        for version_id in $(echo "$versions_to_delete" | head -$MAX_VERSIONS_PER_RUN); do
+          if [ -n "$version_id" ]; then
+            echo "Processing version ID: $version_id"
+            
+            version_details=$(gh api "/user/packages/container/$PACKAGE_NAME/versions/$version_id" 2>/dev/null)
+            if [ $? -eq 0 ]; then
+              tags=$(echo "$version_details" | jq -r '.metadata.container.tags // [] | join(", ")')
+              created_at=$(echo "$version_details" | jq -r '.created_at')
+              
+              if [ -z "$tags" ]; then
+                echo "  Deleting untagged version (created: $created_at)..."
+              else
+                echo "  Deleting tagged version [$tags] (created: $created_at)..."
+              fi
+              
+              if gh api --method DELETE "/user/packages/container/$PACKAGE_NAME/versions/$version_id" --silent 2>/dev/null; then
+                echo "  ✓ Successfully deleted version $version_id"
+                deleted=$((deleted + 1))
+              else
+                echo "  ✗ Failed to delete version $version_id"
+                failed=$((failed + 1))
+              fi
+            else
+              echo "  ℹ Version $version_id no longer exists"
+            fi
+            
+            sleep 1
+          fi
+        done
+        
+        echo ""
+        echo "=== Cleanup Summary ==="
+        echo "Successfully deleted: $deleted versions"
+        echo "Failed to delete: $failed"
+        echo "Remaining old versions: $((old_count - deleted))"
+        
+        echo "deleted-count=$deleted" >> $GITHUB_OUTPUT
+        
+        rm -f /tmp/versions.json /tmp/old_versions.json
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
