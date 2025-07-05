@@ -120,7 +120,19 @@ runs:
           versions_to_delete=$(jq -r --argjson keep "$MIN_VERSIONS_TO_KEEP" '
             map(select((.metadata.container.tags // []) | length == 0)) |
             sort_by(.created_at) | reverse | .[$keep:] | .[].id
-          ' /tmp/old_versions.json)
+          ' /tmp/old_versions.json 2>/dev/null || echo "")
+          
+          if [ -z "$versions_to_delete" ]; then
+            echo "No untagged versions found in old versions"
+            echo "deleted-count=0" >> $GITHUB_OUTPUT
+            
+            # Debug: Show what old versions exist
+            echo "Debug: Showing tags of old versions..."
+            jq -r '.[] | "ID: \(.id), Tags: \(.metadata.container.tags // [])"' /tmp/old_versions.json | head -3
+            
+            rm -f /tmp/versions.json /tmp/old_versions.json
+            exit 0
+          fi
         else
           echo "Finding versions to delete (untagged + old tagged)..."
           # Escape the protected tags pattern for jq
@@ -131,7 +143,19 @@ runs:
               ((.metadata.container.tags // []) | any(test($pattern)) | not)
             )) |
             sort_by(.created_at) | reverse | .[$keep:] | .[].id
-          ' /tmp/old_versions.json)
+          ' /tmp/old_versions.json 2>/dev/null || echo "")
+          
+          if [ -z "$versions_to_delete" ]; then
+            echo "No versions found for deletion after applying filters"
+            echo "deleted-count=0" >> $GITHUB_OUTPUT
+            
+            # Debug: Show what old versions exist
+            echo "Debug: Showing tags of old versions..."
+            jq -r '.[] | "ID: \(.id), Tags: \(.metadata.container.tags // [])"' /tmp/old_versions.json | head -3
+            
+            rm -f /tmp/versions.json /tmp/old_versions.json
+            exit 0
+          fi
         fi
         
         delete_count=$(echo "$versions_to_delete" | grep -v '^$' | wc -l)
